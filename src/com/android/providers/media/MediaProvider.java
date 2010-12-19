@@ -17,8 +17,18 @@
 package com.android.providers.media;
 
 import android.app.SearchManager;
-import android.content.*;
-import android.database.AbstractCursor;
+import android.content.BroadcastReceiver;
+import android.content.ContentProvider;
+import android.content.ContentProviderOperation;
+import android.content.ContentProviderResult;
+import android.content.ContentResolver;
+import android.content.ContentUris;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.OperationApplicationException;
+import android.content.UriMatcher;
 import android.database.Cursor;
 import android.database.DatabaseUtils;
 import android.database.MatrixCursor;
@@ -36,7 +46,6 @@ import android.os.Environment;
 import android.os.FileUtils;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.os.Looper;
 import android.os.MemoryFile;
 import android.os.Message;
 import android.os.ParcelFileDescriptor;
@@ -942,6 +951,26 @@ public class MediaProvider extends ContentProvider {
             updateBucketNames(db, "images");
             updateBucketNames(db, "video");
         }
+
+        if (fromVersion < 91) {
+            // Never query by mini_thumb_magic_index
+            db.execSQL("DROP INDEX IF EXISTS mini_thumb_magic_index");
+
+            // sort the items by taken date in each bucket
+            db.execSQL("CREATE INDEX IF NOT EXISTS image_bucket_index ON images(bucket_id, datetaken)");
+            db.execSQL("CREATE INDEX IF NOT EXISTS video_bucket_index ON video(bucket_id, datetaken)");
+        }
+
+        if (fromVersion < 92) {
+            // Delete albums and artists, then clear the modification time on songs, which
+            // will cause the media scanner to rescan everything, rebuilding the artist and
+            // album tables along the way, while preserving playlists.
+            // We need this rescan because ICU also changed, and now generates different
+            // collation keys
+            db.execSQL("DELETE from albums");
+            db.execSQL("DELETE from artists");
+            db.execSQL("UPDATE audio_meta SET date_modified=0;");
+        }
         sanityCheck(db, fromVersion);
     }
 
@@ -1261,6 +1290,25 @@ public class MediaProvider extends ContentProvider {
         SQLiteDatabase db = database.getReadableDatabase();
         SQLiteQueryBuilder qb = new SQLiteQueryBuilder();
         String limit = uri.getQueryParameter("limit");
+        String filter = uri.getQueryParameter("filter");
+        String [] keywords = null;
+        if (filter != null) {
+            filter = Uri.decode(filter).trim();
+            if (!TextUtils.isEmpty(filter)) {
+                String [] searchWords = filter.split(" ");
+                keywords = new String[searchWords.length];
+                Collator col = Collator.getInstance();
+                col.setStrength(Collator.PRIMARY);
+                for (int i = 0; i < searchWords.length; i++) {
+                    String key = MediaStore.Audio.keyFor(searchWords[i]);
+                    key = key.replace("\\", "\\\\");
+                    key = key.replace("%", "\\%");
+                    key = key.replace("_", "\\_");
+                    keywords[i] = key;
+                }
+            }
+        }
+
         boolean hasThumbnailId = false;
 
         switch (table) {
@@ -1295,11 +1343,21 @@ public class MediaProvider extends ContentProvider {
                 if (projectionIn != null && projectionIn.length == 1 &&  selectionArgs == null
                         && (selection == null || selection.equalsIgnoreCase("is_music=1")
                           || selection.equalsIgnoreCase("is_podcast=1") )
-                        && projectionIn[0].equalsIgnoreCase("count(*)") ) {
+                        && projectionIn[0].equalsIgnoreCase("count(*)")
+                        && keywords != null) {
                     //Log.i("@@@@", "taking fast path for counting songs");
                     qb.setTables("audio_meta");
                 } else {
                     qb.setTables("audio");
+                    for (int i = 0; keywords != null && i < keywords.length; i++) {
+                        if (i > 0) {
+                            qb.appendWhere(" AND ");
+                        }
+                        qb.appendWhere(MediaStore.Audio.Media.ARTIST_KEY +
+                                "||" + MediaStore.Audio.Media.ALBUM_KEY +
+                                "||" + MediaStore.Audio.Media.TITLE_KEY + " LIKE '%" +
+                                keywords[i] + "%' ESCAPE '\\'");
+                    }
                 }
                 break;
 
@@ -1373,6 +1431,13 @@ public class MediaProvider extends ContentProvider {
                 qb.setTables("audio_playlists_map, audio");
                 qb.appendWhere("audio._id = audio_id AND playlist_id = "
                         + uri.getPathSegments().get(3));
+                for (int i = 0; keywords != null && i < keywords.length; i++) {
+                    qb.appendWhere(" AND ");
+                    qb.appendWhere(MediaStore.Audio.Media.ARTIST_KEY +
+                            "||" + MediaStore.Audio.Media.ALBUM_KEY +
+                            "||" + MediaStore.Audio.Media.TITLE_KEY +
+                            " LIKE '%" + keywords[i] + "%' ESCAPE '\\'");
+                }
                 break;
 
             case AUDIO_PLAYLISTS_ID_MEMBERS_ID:
@@ -1382,10 +1447,15 @@ public class MediaProvider extends ContentProvider {
 
             case VIDEO_MEDIA:
                 qb.setTables("video");
+                if (uri.getQueryParameter("distinct") != null) {
+                    qb.setDistinct(true);
+                }
                 break;
-
             case VIDEO_MEDIA_ID:
                 qb.setTables("video");
+                if (uri.getQueryParameter("distinct") != null) {
+                    qb.setDistinct(true);
+                }
                 qb.appendWhere("_id=" + uri.getPathSegments().get(3));
                 break;
 
@@ -1400,13 +1470,21 @@ public class MediaProvider extends ContentProvider {
             case AUDIO_ARTISTS:
                 if (projectionIn != null && projectionIn.length == 1 &&  selectionArgs == null
                         && (selection == null || selection.length() == 0)
-                        && projectionIn[0].equalsIgnoreCase("count(*)") ) {
+                        && projectionIn[0].equalsIgnoreCase("count(*)")
+                        && keywords != null) {
                     //Log.i("@@@@", "taking fast path for counting artists");
                     qb.setTables("audio_meta");
                     projectionIn[0] = "count(distinct artist_id)";
                     qb.appendWhere("is_music=1");
                 } else {
                     qb.setTables("artist_info");
+                    for (int i = 0; keywords != null && i < keywords.length; i++) {
+                        if (i > 0) {
+                            qb.appendWhere(" AND ");
+                        }
+                        qb.appendWhere(MediaStore.Audio.Media.ARTIST_KEY +
+                                " LIKE '%" + keywords[i] + "%' ESCAPE '\\'");
+                    }
                 }
                 break;
 
@@ -1422,6 +1500,12 @@ public class MediaProvider extends ContentProvider {
                 qb.appendWhere("is_music=1 AND audio.album_id IN (SELECT album_id FROM " +
                         "artists_albums_map WHERE artist_id = " +
                          aid + ")");
+                for (int i = 0; keywords != null && i < keywords.length; i++) {
+                    qb.appendWhere(" AND ");
+                    qb.appendWhere(MediaStore.Audio.Media.ARTIST_KEY +
+                            "||" + MediaStore.Audio.Media.ALBUM_KEY +
+                            " LIKE '%" + keywords[i] + "%' ESCAPE '\\'");
+                }
                 groupBy = "audio.album_id";
                 sArtistAlbumsMap.put(MediaStore.Audio.Albums.NUMBER_OF_SONGS_FOR_ARTIST,
                         "count(CASE WHEN artist_id==" + aid + " THEN 'foo' ELSE NULL END) AS " +
@@ -1432,13 +1516,22 @@ public class MediaProvider extends ContentProvider {
             case AUDIO_ALBUMS:
                 if (projectionIn != null && projectionIn.length == 1 &&  selectionArgs == null
                         && (selection == null || selection.length() == 0)
-                        && projectionIn[0].equalsIgnoreCase("count(*)") ) {
+                        && projectionIn[0].equalsIgnoreCase("count(*)")
+                        && keywords != null) {
                     //Log.i("@@@@", "taking fast path for counting albums");
                     qb.setTables("audio_meta");
                     projectionIn[0] = "count(distinct album_id)";
                     qb.appendWhere("is_music=1");
                 } else {
                     qb.setTables("album_info");
+                    for (int i = 0; keywords != null && i < keywords.length; i++) {
+                        if (i > 0) {
+                            qb.appendWhere(" AND ");
+                        }
+                        qb.appendWhere(MediaStore.Audio.Media.ARTIST_KEY +
+                                "||" + MediaStore.Audio.Media.ALBUM_KEY +
+                                " LIKE '%" + keywords[i] + "%' ESCAPE '\\'");
+                    }
                 }
                 break;
 
@@ -1492,18 +1585,21 @@ public class MediaProvider extends ContentProvider {
         for (int i = 0; i < len; i++) {
             // Because we match on individual words here, we need to remove words
             // like 'a' and 'the' that aren't part of the keys.
+            String key = MediaStore.Audio.keyFor(searchWords[i]);
+            key = key.replace("\\", "\\\\");
+            key = key.replace("%", "\\%");
+            key = key.replace("_", "\\_");
             wildcardWords[i] =
                 (searchWords[i].equals("a") || searchWords[i].equals("an") ||
-                        searchWords[i].equals("the")) ? "%" :
-                '%' + MediaStore.Audio.keyFor(searchWords[i]) + '%';
+                        searchWords[i].equals("the")) ? "%" : "%" + key + "%";
         }
 
         String where = "";
         for (int i = 0; i < searchWords.length; i++) {
             if (i == 0) {
-                where = "match LIKE ?";
+                where = "match LIKE ? ESCAPE '\\'";
             } else {
-                where += " AND match LIKE ?";
+                where += " AND match LIKE ? ESCAPE '\\'";
             }
         }
 
@@ -3050,7 +3146,7 @@ public class MediaProvider extends ContentProvider {
 
     private static String TAG = "MediaProvider";
     private static final boolean LOCAL_LOGV = true;
-    private static final int DATABASE_VERSION = 90;
+    private static final int DATABASE_VERSION = 92;
     private static final String INTERNAL_DATABASE_NAME = "internal.db";
 
     // maximum number of cached external databases to keep
